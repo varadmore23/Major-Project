@@ -85,3 +85,56 @@ You can slow requests to reduce load:
 python air_bulletins_scraper.py --language english --category hourly-news --month 2026-05 \
   --min-delay 1.5 --max-delay 4.0 --max-retries 3
 ```
+
+## Running the AIR News Intelligence System (Phase 1)
+
+After scraping and transcribing the audio bulletins, you can run the full RAG pipeline and chatbot.
+
+### 1. Ingest Transcripts
+
+Run the ingestion pipeline to process all new transcripts, classify genres, filter duplicates, generate embeddings, and build the FAISS index and SQLite metadata database.
+
+```bash
+python ingest_pipeline.py
+```
+
+To wipe the existing index and re-process all transcripts from scratch:
+
+```bash
+python ingest_pipeline.py --reindex
+```
+
+### 2. Start the Chatbot API and Web UI
+
+Start the FastAPI server which exposes the chat endpoints and serves the Web UI.
+
+```bash
+uvicorn chatbot_api:app --reload --port 8000
+```
+
+### 3. Access the Web UI
+
+Open your browser and navigate to:
+[http://localhost:8000](http://localhost:8000)
+
+### (Optional) Setup Gemini LLM for Better Answers
+
+For generated answers, export your Google Gemini API key. If not set, the chatbot will fall back to extractive answers (just listing the relevant sources).
+
+**Windows (PowerShell):**
+```powershell
+$env:GEMINI_API_KEY="your_api_key_here"
+```
+
+**Linux/macOS:**
+```bash
+export GEMINI_API_KEY="your_api_key_here"
+```
+
+### Check Vector Store Stats
+
+You can view the statistics of the stored segments, date ranges, and genre breakdowns:
+
+```bash
+python vector_store.py --stats
+```

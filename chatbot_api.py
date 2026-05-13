@@ -1,0 +1,471 @@
+"""
+chatbot_api.py - FastAPI server for the AIR News Intelligence chatbot
+
+Endpoints:
+  POST /chat    - Send a message and get RAG-powered response
+  GET  /stats   - Vector store statistics
+  GET  /health  - Health check
+  GET  /        - Serve the web chat UI
+
+Run with:
+  uvicorn chatbot_api:app --reload --port 8000
+"""
+
+import logging
+import uuid
+from typing import Optional
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+import rag_engine
+import vector_store
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("chatbot_api")
+
+app = FastAPI(
+    title="VaniStream - AIR News Intelligence",
+    description="RAG-powered chatbot for All India Radio broadcast news",
+    version="1.0.0",
+)
+
+# In-memory conversation history: session_id -> list of {role, content}
+_sessions: dict[str, list[dict]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Request / Response Models
+# ---------------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    """Chat request body."""
+    message: str
+    session_id: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    """Chat response body."""
+    reply: str
+    sources: list[dict]
+    filters: dict
+    session_id: str
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Process a chat message through the RAG engine."""
+    sid = req.session_id or str(uuid.uuid4())
+
+    if sid not in _sessions:
+        _sessions[sid] = []
+
+    # Add user message to history
+    _sessions[sid].append({"role": "user", "content": req.message})
+
+    # Get last 3 turns for context
+    history = _sessions[sid][-6:]  # 3 turns = 6 messages (user+model)
+
+    result = rag_engine.answer_query(req.message, history=history)
+
+    # Add assistant response to history
+    _sessions[sid].append({"role": "model", "content": result["answer"]})
+
+    # Trim history to avoid unbounded growth
+    if len(_sessions[sid]) > 20:
+        _sessions[sid] = _sessions[sid][-20:]
+
+    return ChatResponse(
+        reply=result["answer"],
+        sources=result["sources"],
+        filters=result["filters_applied"],
+        session_id=sid,
+    )
+
+
+@app.get("/stats")
+async def stats():
+    """Return vector store statistics."""
+    return vector_store.get_stats()
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok"}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def ui():
+    """Serve the chatbot web UI."""
+    return CHAT_HTML
+
+
+# ---------------------------------------------------------------------------
+# Inline Chat UI
+# ---------------------------------------------------------------------------
+
+CHAT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VaniStream - AIR News Intelligence</title>
+<meta name="description" content="AI-powered chatbot for All India Radio broadcast news intelligence">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-tertiary: #21262d;
+    --surface: #1c2333;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-muted: #6e7681;
+    --accent: #58a6ff;
+    --accent-glow: rgba(88, 166, 255, 0.15);
+    --accent-gradient: linear-gradient(135deg, #58a6ff 0%, #bc8cff 100%);
+    --user-bubble: #1f3a5f;
+    --bot-bubble: #1c2333;
+    --success: #3fb950;
+    --warning: #d29922;
+    --radius: 12px;
+    --shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Header */
+  .header {
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  .header-logo {
+    width: 40px; height: 40px;
+    background: var(--accent-gradient);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 700; color: #fff;
+  }
+  .header h1 {
+    font-size: 20px; font-weight: 700;
+    background: var(--accent-gradient);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .header p { font-size: 12px; color: var(--text-secondary); }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--success); margin-left: auto;
+    box-shadow: 0 0 8px var(--success);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  /* Chat area */
+  .chat-container {
+    flex: 1; overflow-y: auto; padding: 24px;
+    display: flex; flex-direction: column; gap: 16px;
+    scroll-behavior: smooth;
+  }
+  .chat-container::-webkit-scrollbar { width: 6px; }
+  .chat-container::-webkit-scrollbar-track { background: transparent; }
+  .chat-container::-webkit-scrollbar-thumb {
+    background: var(--border); border-radius: 3px;
+  }
+
+  .message { max-width: 75%; animation: fadeIn 0.3s ease; }
+  .message.user { align-self: flex-end; }
+  .message.bot { align-self: flex-start; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .bubble {
+    padding: 14px 18px; border-radius: var(--radius);
+    font-size: 14px; line-height: 1.6; word-wrap: break-word;
+  }
+  .user .bubble {
+    background: var(--user-bubble);
+    border: 1px solid rgba(88,166,255,0.2);
+    border-bottom-right-radius: 4px;
+  }
+  .bot .bubble {
+    background: var(--bot-bubble);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+  }
+  .msg-label {
+    font-size: 11px; color: var(--text-muted);
+    margin-bottom: 4px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .user .msg-label { text-align: right; }
+
+  /* Sources */
+  .sources {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .sources-title {
+    font-size: 11px; color: var(--text-muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .source-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; margin: 3px 4px 3px 0;
+    font-size: 11px; color: var(--text-secondary);
+    transition: border-color 0.2s;
+  }
+  .source-chip:hover { border-color: var(--accent); }
+  .source-genre {
+    background: var(--accent-glow); color: var(--accent);
+    padding: 1px 6px; border-radius: 4px; font-weight: 600;
+  }
+
+  /* Typing indicator */
+  .typing { display: flex; gap: 4px; padding: 8px 0; }
+  .typing span {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-muted);
+    animation: bounce 1.4s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-8px); }
+  }
+
+  /* Input area */
+  .input-area {
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    padding: 16px 24px; flex-shrink: 0;
+  }
+  .input-row {
+    display: flex; gap: 12px; max-width: 900px; margin: 0 auto;
+  }
+  #chatInput {
+    flex: 1; background: var(--bg-tertiary);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 18px; color: var(--text-primary);
+    font-family: inherit; font-size: 14px; outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    resize: none; min-height: 48px; max-height: 120px;
+  }
+  #chatInput:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  #chatInput::placeholder { color: var(--text-muted); }
+  #sendBtn {
+    background: var(--accent-gradient);
+    border: none; border-radius: var(--radius);
+    padding: 0 24px; color: #fff; font-weight: 600;
+    font-size: 14px; cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.2s;
+    white-space: nowrap;
+  }
+  #sendBtn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px rgba(88,166,255,0.3);
+  }
+  #sendBtn:active { transform: translateY(0); }
+  #sendBtn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+  /* Welcome */
+  .welcome {
+    text-align: center; margin: auto; padding: 40px;
+    max-width: 500px;
+  }
+  .welcome h2 {
+    font-size: 24px; margin-bottom: 8px;
+    background: var(--accent-gradient);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .welcome p { color: var(--text-secondary); font-size: 14px; line-height: 1.6; }
+  .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; justify-content: center; }
+  .suggestion {
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px;
+    color: var(--text-secondary); cursor: pointer;
+    transition: all 0.2s;
+  }
+  .suggestion:hover {
+    border-color: var(--accent); color: var(--accent);
+    background: var(--accent-glow);
+  }
+
+  @media (max-width: 600px) {
+    .message { max-width: 90%; }
+    .header { padding: 12px 16px; }
+    .input-area { padding: 12px 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-logo">V</div>
+  <div>
+    <h1>VaniStream</h1>
+    <p>AIR News Intelligence Assistant</p>
+  </div>
+  <div class="status-dot" title="System online"></div>
+</div>
+
+<div class="chat-container" id="chatBox">
+  <div class="welcome" id="welcome">
+    <h2>Welcome to VaniStream</h2>
+    <p>Ask me anything about recent All India Radio news broadcasts.
+       I can search by topic, date, and genre.</p>
+    <div class="suggestions">
+      <div class="suggestion" onclick="askSuggestion(this)">What happened in politics last week?</div>
+      <div class="suggestion" onclick="askSuggestion(this)">Latest sports news</div>
+      <div class="suggestion" onclick="askSuggestion(this)">Economy updates today</div>
+      <div class="suggestion" onclick="askSuggestion(this)">Defence news last 15 days</div>
+    </div>
+  </div>
+</div>
+
+<div class="input-area">
+  <div class="input-row">
+    <textarea id="chatInput" placeholder="Ask about AIR news broadcasts..."
+              rows="1" onkeydown="handleKey(event)"></textarea>
+    <button id="sendBtn" onclick="sendMessage()">Send</button>
+  </div>
+</div>
+
+<script>
+let sessionId = null;
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function askSuggestion(el) {
+  document.getElementById('chatInput').value = el.textContent;
+  sendMessage();
+}
+
+function addMessage(role, text, sources) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
+  const box = document.getElementById('chatBox');
+  const div = document.createElement('div');
+  div.className = 'message ' + role;
+
+  let html = '<div class="msg-label">' + (role === 'user' ? 'You' : 'VaniStream') + '</div>';
+  html += '<div class="bubble">' + escapeHtml(text).replace(/\\n/g, '<br>') + '</div>';
+
+  if (sources && sources.length > 0) {
+    html += '<div class="sources"><div class="sources-title">Sources</div>';
+    sources.forEach(s => {
+      html += '<div class="source-chip">'
+        + '<span>' + s.date + '</span>'
+        + '<span class="source-genre">' + s.genre + '</span>'
+        + '<span>score: ' + (s.score ? s.score.toFixed(2) : '-') + '</span>'
+        + '</div>';
+    });
+    html += '</div>';
+  }
+  div.innerHTML = html;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function showTyping() {
+  const box = document.getElementById('chatBox');
+  const div = document.createElement('div');
+  div.className = 'message bot';
+  div.id = 'typingIndicator';
+  div.innerHTML = '<div class="msg-label">VaniStream</div>'
+    + '<div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function removeTyping() {
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
+function escapeHtml(t) {
+  const d = document.createElement('div');
+  d.textContent = t;
+  return d.innerHTML;
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const btn = document.getElementById('sendBtn');
+  const msg = input.value.trim();
+  if (!msg) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  btn.disabled = true;
+
+  addMessage('user', msg);
+  showTyping();
+
+  try {
+    const body = { message: msg };
+    if (sessionId) body.session_id = sessionId;
+
+    const resp = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    sessionId = data.session_id;
+    removeTyping();
+    addMessage('bot', data.reply, data.sources);
+  } catch (err) {
+    removeTyping();
+    addMessage('bot', 'Sorry, something went wrong. Please try again.');
+  }
+  btn.disabled = false;
+  input.focus();
+}
+
+// Auto-resize textarea
+document.getElementById('chatInput').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+</script>
+</body>
+</html>"""
